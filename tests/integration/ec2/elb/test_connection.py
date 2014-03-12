@@ -24,20 +24,35 @@
 Initial, and very limited, unit tests for ELBConnection.
 """
 
+import boto
+import time
 import unittest
 from boto.ec2.elb import ELBConnection
 
 class ELBConnectionTest(unittest.TestCase):
     ec2 = True
 
-    def setup(self):
+    def setUp(self):
         """Creates a named load balancer that can be safely
         deleted at the end of each test"""
         self.conn = ELBConnection()
         self.name = 'elb-boto-unit-test'
         self.availability_zones = ['us-east-1a']
         self.listeners = [(80, 8000, 'HTTP')]
-        self.balancer = self.conn.create_load_balancer(name, availability_zones, listeners)
+        self.balancer = self.conn.create_load_balancer(self.name, self.availability_zones, self.listeners)
+
+        # S3 bucket for log tests
+        self.s3 = boto.connect_s3()
+        self.timestamp = str(int(time.time()))
+        self.bucket_name = 'boto-elb-%s' % self.timestamp
+        self.bucket = self.s3.create_bucket(self.bucket_name)
+        self.bucket.set_canned_acl('public-read-write')
+        self.addCleanup(self.cleanup_bucket, self.bucket)
+
+    def cleanup_bucket(self, bucket):
+        for key in bucket.get_all_keys():
+            key.delete()
+        bucket.delete()
 
     def tearDown(self):
         """ Deletes the test load balancer after every test.
@@ -80,7 +95,7 @@ class ELBConnectionTest(unittest.TestCase):
 
     def test_delete_load_balancer_listeners(self):
         mod_listeners = [(80, 8000, 'HTTP'), (443, 8001, 'HTTP')]
-        mod_name = self.name + "_mod"
+        mod_name = self.name + "-mod"
         self.mod_balancer = self.conn.create_load_balancer(mod_name,\
             self.availability_zones, mod_listeners)
 
@@ -117,6 +132,72 @@ class ELBConnectionTest(unittest.TestCase):
             )
         # Policy names should be checked here once they are supported
         # in the Listener object.
+
+    def test_create_load_balancer_backend_with_policies(self):
+        other_policy_name = 'enable-proxy-protocol'
+        backend_port = 8081
+        self.conn.create_lb_policy(self.name, other_policy_name,
+                                   'ProxyProtocolPolicyType', {'ProxyProtocol': True})
+        self.conn.set_lb_policies_of_backend_server(self.name, backend_port, [other_policy_name])
+
+        balancers = self.conn.get_all_load_balancers(load_balancer_names=[self.name])
+        self.assertEqual([lb.name for lb in balancers], [self.name])
+        self.assertEqual(len(balancers[0].policies.other_policies), 1)
+        self.assertEqual(balancers[0].policies.other_policies[0].policy_name, other_policy_name)
+        self.assertEqual(len(balancers[0].backends), 1)
+        self.assertEqual(balancers[0].backends[0].instance_port, backend_port)
+        self.assertEqual(balancers[0].backends[0].policies[0].policy_name, other_policy_name)
+
+        self.conn.set_lb_policies_of_backend_server(self.name, backend_port, [])
+
+        balancers = self.conn.get_all_load_balancers(load_balancer_names=[self.name])
+        self.assertEqual([lb.name for lb in balancers], [self.name])
+        self.assertEqual(len(balancers[0].policies.other_policies), 1)
+        self.assertEqual(len(balancers[0].backends), 0)
+
+    def test_create_load_balancer_complex_listeners(self):
+        complex_listeners = [
+            (8080, 80, 'HTTP', 'HTTP'),
+            (2525, 25, 'TCP', 'TCP'),
+        ]
+
+        self.conn.create_load_balancer_listeners(
+            self.name,
+            complex_listeners=complex_listeners
+        )
+
+        balancers = self.conn.get_all_load_balancers(
+            load_balancer_names=[self.name]
+        )
+        self.assertEqual([lb.name for lb in balancers], [self.name])
+        self.assertEqual(
+            sorted(l.get_complex_tuple() for l in balancers[0].listeners),
+            # We need an extra 'HTTP' here over what ``self.listeners`` uses.
+            sorted([(80, 8000, 'HTTP', 'HTTP')] + complex_listeners)
+        )
+
+    def test_load_balancer_access_log(self):
+        attributes = self.balancer.get_attributes()
+
+        self.assertEqual(False, attributes.access_log.enabled)
+
+        attributes.access_log.enabled = True
+        attributes.access_log.s3_bucket_name = self.bucket_name
+        attributes.access_log.s3_bucket_prefix = 'access-logs'
+        attributes.access_log.emit_interval = 5
+
+        self.conn.modify_lb_attribute(self.balancer.name, 'accessLog',
+                                      attributes.access_log)
+
+        new_attributes = self.balancer.get_attributes()
+
+        self.assertEqual(True, new_attributes.access_log.enabled)
+        self.assertEqual(self.bucket_name,
+            new_attributes.access_log.s3_bucket_name)
+        self.assertEqual('access-logs',
+            new_attributes.access_log.s3_bucket_prefix)
+        self.assertEqual(5, new_attributes.access_log.emit_interval)
+
 
 if __name__ == '__main__':
     unittest.main()

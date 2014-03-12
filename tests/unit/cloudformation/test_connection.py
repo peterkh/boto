@@ -11,6 +11,7 @@ from mock import Mock
 
 from tests.unit import AWSMockServiceTestCase
 from boto.cloudformation.connection import CloudFormationConnection
+from boto.exception import BotoServerError
 
 
 SAMPLE_TEMPLATE = r"""
@@ -108,12 +109,24 @@ class TestCloudFormationCreateStack(CloudFormationConnectionBase):
 
     def test_create_stack_fails(self):
         self.set_http_response(status_code=400, reason='Bad Request',
-                               body='Invalid arg.')
-        with self.assertRaises(self.service_connection.ResponseError):
+            body='{"Error": {"Code": 1, "Message": "Invalid arg."}}')
+        with self.assertRaisesRegexp(self.service_connection.ResponseError,
+            'Invalid arg.'):
             api_response = self.service_connection.create_stack(
                 'stack_name', template_body=SAMPLE_TEMPLATE,
                 parameters=[('KeyName', 'myKeyName')])
 
+    def test_create_stack_fail_error(self):
+        self.set_http_response(status_code=400, reason='Bad Request',
+            body='{"RequestId": "abc", "Error": {"Code": 1, "Message": "Invalid arg."}}')
+        try:
+            api_response = self.service_connection.create_stack(
+                'stack_name', template_body=SAMPLE_TEMPLATE,
+                parameters=[('KeyName', 'myKeyName')])
+        except BotoServerError, e:
+            self.assertEqual('abc', e.request_id)
+            self.assertEqual(1, e.error_code)
+            self.assertEqual('Invalid arg.', e.message)
 
 class TestCloudFormationUpdateStack(CloudFormationConnectionBase):
     def default_body(self):
@@ -421,7 +434,7 @@ class TestCloudFormationDescribeStacks(CloudFormationConnectionBase):
         self.assertEqual(stack.creation_time,
                          datetime(2012, 5, 16, 22, 55, 31))
         self.assertEqual(stack.description, 'My Description')
-        self.assertEqual(stack.disable_rollback, True)
+        self.assertEqual(stack.disable_rollback, False)
         self.assertEqual(stack.stack_id, 'arn:aws:cfn:us-east-1:1:stack')
         self.assertEqual(stack.stack_status, 'CREATE_COMPLETE')
         self.assertEqual(stack.stack_name, 'MyStack')
@@ -462,14 +475,14 @@ class TestCloudFormationListStackResources(CloudFormationConnectionBase):
                   <member>
                     <ResourceStatus>CREATE_COMPLETE</ResourceStatus>
                     <LogicalResourceId>SampleDB</LogicalResourceId>
-                    <LastUpdatedTimestamp>2011-06-21T20:25:57Z</LastUpdatedTimestamp>
+                    <LastUpdatedTime>2011-06-21T20:25:57Z</LastUpdatedTime>
                     <PhysicalResourceId>My-db-ycx</PhysicalResourceId>
                     <ResourceType>AWS::RDS::DBInstance</ResourceType>
                   </member>
                   <member>
                     <ResourceStatus>CREATE_COMPLETE</ResourceStatus>
                     <LogicalResourceId>CPUAlarmHigh</LogicalResourceId>
-                    <LastUpdatedTimestamp>2011-06-21T20:29:23Z</LastUpdatedTimestamp>
+                    <LastUpdatedTime>2011-06-21T20:29:23Z</LastUpdatedTime>
                     <PhysicalResourceId>MyStack-CPUH-PF</PhysicalResourceId>
                     <ResourceType>AWS::CloudWatch::Alarm</ResourceType>
                   </member>
@@ -486,7 +499,7 @@ class TestCloudFormationListStackResources(CloudFormationConnectionBase):
         resources = self.service_connection.list_stack_resources('MyStack',
                                                               next_token='next_token')
         self.assertEqual(len(resources), 2)
-        self.assertEqual(resources[0].last_updated_timestamp,
+        self.assertEqual(resources[0].last_updated_time,
                          datetime(2011, 6, 21, 20, 25, 57))
         self.assertEqual(resources[0].logical_resource_id, 'SampleDB')
         self.assertEqual(resources[0].physical_resource_id, 'My-db-ycx')
@@ -494,7 +507,7 @@ class TestCloudFormationListStackResources(CloudFormationConnectionBase):
         self.assertEqual(resources[0].resource_status_reason, None)
         self.assertEqual(resources[0].resource_type, 'AWS::RDS::DBInstance')
 
-        self.assertEqual(resources[1].last_updated_timestamp,
+        self.assertEqual(resources[1].last_updated_time,
                          datetime(2011, 6, 21, 20, 29, 23))
         self.assertEqual(resources[1].logical_resource_id, 'CPUAlarmHigh')
         self.assertEqual(resources[1].physical_resource_id, 'MyStack-CPUH-PF')
@@ -569,6 +582,10 @@ class TestCloudFormationValidateTemplate(CloudFormationConnectionBase):
                     <Description>EC2 KeyPair</Description>
                   </member>
                 </Parameters>
+                <CapabilitiesReason>Reason</CapabilitiesReason>
+                <Capabilities>
+                  <member>CAPABILITY_IAM</member>
+                </Capabilities>
               </ValidateTemplateResult>
               <ResponseMetadata>
                 <RequestId>0be7b6e8-e4a0-11e0-a5bd-9f8d5a7dbc91</RequestId>
@@ -593,10 +610,106 @@ class TestCloudFormationValidateTemplate(CloudFormationConnectionBase):
         self.assertEqual(param2.no_echo, True)
         self.assertEqual(param2.parameter_key, 'KeyName')
 
+        self.assertEqual(template.capabilities_reason, 'Reason')
+
+        self.assertEqual(len(template.capabilities), 1)
+        self.assertEqual(template.capabilities[0].value, 'CAPABILITY_IAM')
+
         self.assert_request_parameters({
             'Action': 'ValidateTemplate',
             'TemplateBody': SAMPLE_TEMPLATE,
             'TemplateURL': 'http://url',
+            'Version': '2010-05-15',
+        })
+
+
+class TestCloudFormationCancelUpdateStack(CloudFormationConnectionBase):
+    def default_body(self):
+        return """<CancelUpdateStackResult/>"""
+
+    def test_cancel_update_stack(self):
+        self.set_http_response(status_code=200)
+        api_response = self.service_connection.cancel_update_stack('stack_name')
+        self.assertEqual(api_response, True)
+        self.assert_request_parameters({
+            'Action': 'CancelUpdateStack',
+            'StackName': 'stack_name',
+            'Version': '2010-05-15',
+        })
+
+
+class TestCloudFormationEstimateTemplateCost(CloudFormationConnectionBase):
+    def default_body(self):
+        return """
+            {
+                "EstimateTemplateCostResponse": {
+                    "EstimateTemplateCostResult": {
+                        "Url": "http://calculator.s3.amazonaws.com/calc5.html?key=cf-2e351785-e821-450c-9d58-625e1e1ebfb6"
+                    }
+                }
+            }
+        """
+
+    def test_estimate_template_cost(self):
+        self.set_http_response(status_code=200)
+        api_response = self.service_connection.estimate_template_cost(
+            template_body='{}')
+        self.assertEqual(api_response,
+            'http://calculator.s3.amazonaws.com/calc5.html?key=cf-2e351785-e821-450c-9d58-625e1e1ebfb6')
+        self.assert_request_parameters({
+            'Action': 'EstimateTemplateCost',
+            'ContentType': 'JSON',
+            'TemplateBody': '{}',
+            'Version': '2010-05-15',
+        })
+
+
+class TestCloudFormationGetStackPolicy(CloudFormationConnectionBase):
+    def default_body(self):
+        return """
+            {
+                "GetStackPolicyResponse": {
+                    "GetStackPolicyResult": {
+                        "StackPolicyBody": "{...}"
+                    }
+                }
+            }
+        """
+
+    def test_get_stack_policy(self):
+        self.set_http_response(status_code=200)
+        api_response = self.service_connection.get_stack_policy('stack-id')
+        self.assertEqual(api_response, '{...}')
+        self.assert_request_parameters({
+            'Action': 'GetStackPolicy',
+            'ContentType': 'JSON',
+            'StackName': 'stack-id',
+            'Version': '2010-05-15',
+        })
+
+
+class TestCloudFormationSetStackPolicy(CloudFormationConnectionBase):
+    def default_body(self):
+        return """
+            {
+                "SetStackPolicyResponse": {
+                    "SetStackPolicyResult": {
+                        "Some": "content"
+                    }
+                }
+            }
+        """
+
+    def test_set_stack_policy(self):
+        self.set_http_response(status_code=200)
+        api_response = self.service_connection.set_stack_policy('stack-id',
+            stack_policy_body='{}')
+        self.assertEqual(api_response['Some'], 'content')
+        self.assert_request_parameters({
+            'Action': 'SetStackPolicy',
+            'ContentType': 'JSON',
+            'StackName': 'stack-id',
+            'StackPolicyBody': '{}',
             'Version': '2010-05-15',
         })
 

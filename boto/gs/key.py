@@ -109,6 +109,9 @@ class Key(S3Key):
         self.metageneration = resp.getheader('x-goog-metageneration', None)
         self.generation = resp.getheader('x-goog-generation', None)
 
+    def handle_restore_headers(self, response):
+        return
+
     def handle_addl_headers(self, headers):
         for key, value in headers:
             if key == 'x-goog-hash':
@@ -117,7 +120,48 @@ class Key(S3Key):
                     self.cloud_hashes[alg] = binascii.a2b_base64(b64_digest)
             elif key == 'x-goog-component-count':
                 self.component_count = int(value)
+            elif key == 'x-goog-generation':
+                self.generation = value
+            # Use x-goog-stored-content-encoding and
+            # x-goog-stored-content-length to indicate original content length
+            # and encoding, which are transcoding-invariant (so are preferable
+            # over using content-encoding and size headers).
+            elif key == 'x-goog-stored-content-encoding':
+                self.content_encoding = value
+            elif key == 'x-goog-stored-content-length':
+                self.size = int(value)
 
+    def open_read(self, headers=None, query_args='',
+                  override_num_retries=None, response_headers=None):
+        """
+        Open this key for reading
+
+        :type headers: dict
+        :param headers: Headers to pass in the web request
+
+        :type query_args: string
+        :param query_args: Arguments to pass in the query string
+            (ie, 'torrent')
+
+        :type override_num_retries: int
+        :param override_num_retries: If not None will override configured
+            num_retries parameter for underlying GET.
+
+        :type response_headers: dict
+        :param response_headers: A dictionary containing HTTP
+            headers/values that will override any headers associated
+            with the stored object in the response.  See
+            http://goo.gl/EWOPb for details.
+        """
+        # For GCS we need to include the object generation in the query args.
+        # The rest of the processing is handled in the parent class.
+        if self.generation:
+            if query_args:
+                query_args += '&'
+            query_args += 'generation=%s' % self.generation
+        super(Key, self).open_read(headers=headers, query_args=query_args,
+                                   override_num_retries=override_num_retries,
+                                   response_headers=response_headers)
 
     def get_file(self, fp, headers=None, cb=None, num_cb=10,
                  torrent=False, version_id=None, override_num_retries=None,
@@ -178,7 +222,7 @@ class Key(S3Key):
             with the stored object in the response. See
             http://goo.gl/sMkcC for details.
         """
-        if self.bucket != None:
+        if self.bucket is not None:
             if res_download_handler:
                 res_download_handler.get_file(self, fp, headers, cb, num_cb,
                                               torrent=torrent,
@@ -267,9 +311,10 @@ class Key(S3Key):
                                  chunked_transfer=chunked_transfer, size=size,
                                  hash_algs=hash_algs)
 
-    def delete(self):
+    def delete(self, headers=None):
         return self.bucket.delete_key(self.name, version_id=self.version_id,
-                                      generation=self.generation)
+                                      generation=self.generation,
+                                      headers=headers)
 
     def add_email_grant(self, permission, email_address):
         """
@@ -486,7 +531,7 @@ class Key(S3Key):
 
         if hasattr(fp, 'name'):
             self.path = fp.name
-        if self.bucket != None:
+        if self.bucket is not None:
             if isinstance(fp, KeyFile):
                 # Avoid EOF seek for KeyFile case as it's very inefficient.
                 key = fp.getkey()
@@ -510,12 +555,12 @@ class Key(S3Key):
                 fp.seek(spos)
                 size = self.size
 
-            if md5 == None:
+            if md5 is None:
                 md5 = self.compute_md5(fp, size)
             self.md5 = md5[0]
             self.base64md5 = md5[1]
 
-            if self.name == None:
+            if self.name is None:
                 self.name = self.md5
 
             if not replace:
@@ -750,7 +795,7 @@ class Key(S3Key):
             the acl will only be updated if its current metageneration number is
             this value.
         """
-        if self.bucket != None:
+        if self.bucket is not None:
             self.bucket.set_acl(acl_or_str, self.name, headers=headers,
                                 generation=generation,
                                 if_generation=if_generation,
@@ -767,7 +812,7 @@ class Key(S3Key):
 
         :rtype: :class:`.gs.acl.ACL`
         """
-        if self.bucket != None:
+        if self.bucket is not None:
             return self.bucket.get_acl(self.name, headers=headers,
                                        generation=generation)
 
@@ -782,7 +827,7 @@ class Key(S3Key):
 
         :rtype: str
         """
-        if self.bucket != None:
+        if self.bucket is not None:
             return self.bucket.get_xml_acl(self.name, headers=headers,
                                            generation=generation)
 
@@ -810,7 +855,7 @@ class Key(S3Key):
             the acl will only be updated if its current metageneration number is
             this value.
         """
-        if self.bucket != None:
+        if self.bucket is not None:
             return self.bucket.set_xml_acl(acl_str, self.name, headers=headers,
                                            generation=generation,
                                            if_generation=if_generation,
@@ -841,7 +886,7 @@ class Key(S3Key):
             the acl will only be updated if its current metageneration number is
             this value.
         """
-        if self.bucket != None:
+        if self.bucket is not None:
             return self.bucket.set_canned_acl(
                 acl_str,
                 self.name,
@@ -889,3 +934,7 @@ class Key(S3Key):
         if resp.status < 200 or resp.status > 299:
             raise self.bucket.connection.provider.storage_response_error(
                 resp.status, resp.reason, resp.read())
+
+        # Return the generation so that the result URI can be built with this
+        # for automatic parallel uploads.
+        return resp.getheader('x-goog-generation')

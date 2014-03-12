@@ -73,10 +73,10 @@ Simple example::
 
 A full example::
 
-    >>> from boto.dynamodb2.fields import HashKey, RangeKey, KeysOnlyIndex
-    >>> from boto.dynamodb2.layer1 import DynamoDBConnection
+    >>> import boto.dynamodb2
+    >>> from boto.dynamodb2.fields import HashKey, RangeKey, KeysOnlyIndex, AllIndex
     >>> from boto.dynamodb2.table import Table
-    >>> from boto.dynamodb2.types import Number
+    >>> from boto.dynamodb2.types import NUMBER
 
     >>> users = Table.create('users', schema=[
     ...     HashKey('account_type', data_type=NUMBER),
@@ -90,11 +90,7 @@ A full example::
     ...     ])
     ... ],
     ... # If you need to specify custom parameters like keys or region info...
-    ... connection=DynamoDBConnection(
-    ...     aws_access_key_id='key',
-    ...     aws_secret_access_key='key',
-    ...     region='us-west-2'
-    ... ))
+    ... connection= boto.dynamodb2.connect_to_region('us-east-1'))
 
 
 Using an Existing Table
@@ -112,7 +108,9 @@ Lazy example::
 
 Efficient example::
 
+    >>> from boto.dynamodb2.fields import HashKey, RangeKey, AllIndex
     >>> from boto.dynamodb2.table import Table
+    >>> from boto.dynamodb2.types import NUMBER
     >>> users = Table('users', schema=[
     ...     HashKey('account_type', data_type=NUMBER),
     ...     RangeKey('last_name'),
@@ -206,8 +204,8 @@ three choices.
 
 The first is sending all the data with the expectation nothing has changed
 since you read the data. DynamoDB will verify the data is in the original state
-and, if so, will all of the item's data. If that expectation fails, the call
-will fail::
+and, if so, will send all of the item's data. If that expectation fails, the
+call will fail::
 
     >>> johndoe = users.get_item(username='johndoe')
     >>> johndoe['first_name'] = 'Johann'
@@ -275,7 +273,7 @@ both speed up the process & reduce the number of write requests made to the
 service.
 
 Batch writing involves wrapping the calls you want batched in a context manager.
-The context manager immitates the ``Table.put_item`` & ``Table.delete_item``
+The context manager imitates the ``Table.put_item`` & ``Table.delete_item``
 APIs. Getting & using the context manager looks like::
 
     >>> from boto.dynamodb2.table import Table
@@ -382,6 +380,25 @@ fields::
     'Alice'
     'Jane'
 
+By default, DynamoDB can return a large amount of data per-request (up to 1Mb
+of data). To prevent these requests from drowning other smaller gets, you can
+specify a smaller page size via the ``max_page_size`` argument to
+``Table.query`` & ``Table.scan``. Doing so looks like::
+
+    # Small pages yield faster responses & less potential of drowning other
+    # requests.
+    >>> all_users = users.query(
+    ...     account_type__eq='standard_user',
+    ...     date_joined__gte=0,
+    ...     max_page_size=10
+    ... )
+
+    # Usage is the same, but now many smaller requests are done.
+    >>> for user in recent:
+    ...     print user['first_name']
+    'Alice'
+    'Jane'
+
 Finally, if you need to query on data that's not in either a key or in an
 index, you can run a ``Table.scan`` across the whole table, which accepts a
 similar but expanded set of filters. If you're familiar with the Map/Reduce
@@ -407,6 +424,142 @@ Filtering a scan looks like::
     ...     print user['first_name']
     'George'
     'John'
+
+
+The ``ResultSet``
+~~~~~~~~~~~~~~~~~
+
+Both ``Table.query`` & ``Table.scan`` return an object called ``ResultSet``.
+It's a lazily-evaluated object that uses the `Iterator protocol`_. It delays
+your queries until you request the next item in the result set.
+
+Typical use is simply a standard ``for`` to iterate over the results::
+
+    >>> result_set = users.scan()
+    >>> for user in result_set:
+    ...     print user['first_name']
+
+However, this throws away results as it fetches more data. As a result, you
+can't index it like a ``list``.
+
+    >>> len(result_set)
+    0
+
+Because it does this, if you need to loop over your results more than once (or
+do things like negative indexing, length checks, etc.), you should wrap it in
+a call to ``list()``. Ex.::
+
+    >>> result_set = users.scan()
+    >>> all_users = list(result_set)
+    # Slice it for every other user.
+    >>> for user in all_users[::2]:
+    ...     print user['first_name']
+
+.. warning::
+
+    Wrapping calls like the above in ``list(...)`` **WILL** cause it to evaluate
+    the **ENTIRE** potentially large data set.
+
+    Appropriate use of the ``limit=...`` kwarg to ``Table.query`` &
+    ``Table.scan`` calls are **VERY** important should you chose to do this.
+
+    Alternatively, you can build your own list, using ``for`` on the
+    ``ResultSet`` to lazily build the list (& potentially stop early).
+
+.. _`Iterator protocol`: http://docs.python.org/2/library/stdtypes.html#iterator-types
+
+
+Parallel Scan
+-------------
+
+DynamoDB also includes a feature called "Parallel Scan", which allows you
+to make use of **extra** read capacity to divide up your result set & scan
+an entire table faster.
+
+This does require extra code on the user's part & you should ensure that
+you need the speed boost, have enough data to justify it and have the extra
+capacity to read it without impacting other queries/scans.
+
+To run it, you should pick the ``total_segments`` to use, which is an integer
+representing the number of temporary partitions you'd divide your table into.
+You then need to spin up a thread/process for each one, giving each
+thread/process a ``segment``, which is a zero-based integer of the segment
+you'd like to scan.
+
+An example of using parallel scan to send out email to all users might look
+something like::
+
+    #!/usr/bin/env python
+    import threading
+
+    import boto.ses
+    import boto.dynamodb2
+    from boto.dynamodb2.table import Table
+
+
+    AWS_ACCESS_KEY_ID = '<YOUR_AWS_KEY_ID>'
+    AWS_SECRET_ACCESS_KEY = '<YOUR_AWS_SECRET_KEY>'
+    APPROVED_EMAIL = 'some@address.com'
+
+
+    def send_email(email):
+        # Using Amazon's Simple Email Service, send an email to a given
+        # email address. You must already have an email you've verified with
+        # AWS before this will work.
+        conn = boto.ses.connect_to_region(
+            'us-east-1',
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+        )
+        conn.send_email(
+            APPROVED_EMAIL,
+            "[OurSite] New feature alert!",
+            "We've got some exciting news! We added a new feature to...",
+            [email]
+        )
+
+
+    def process_segment(segment=0, total_segments=10):
+        # This method/function is executed in each thread, each getting its
+        # own segment to process through.
+        conn = boto.dynamodb2.connect_to_region(
+            'us-east-1',
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+        )
+        table = Table('users', connection=conn)
+
+        # We pass in the segment & total_segments to scan here.
+        for user in table.scan(segment=segment, total_segments=total_segments):
+            send_email(user['email'])
+
+
+    def send_all_emails():
+        pool = []
+        # We're choosing to divide the table in 3, then...
+        pool_size = 3
+
+        # ...spinning up a thread for each segment.
+        for i in range(pool_size):
+            worker = threading.Thread(
+                target=process_segment,
+                kwargs={
+                    'segment': i,
+                    'total_segments': pool_size,
+                }
+            )
+            pool.append(worker)
+            # We start them to let them start scanning & consuming their
+            # assigned segment.
+            worker.start()
+
+        # Finally, we wait for each to finish.
+        for thread in pool:
+            thread.join()
+
+
+    if __name__ == '__main__':
+        send_all_emails()
 
 
 Batch Reading
@@ -453,6 +606,30 @@ Deleting a table is a simple exercise. When you no longer need a table, simply
 run::
 
     >>> users.delete()
+
+
+DynamoDB Local
+--------------
+
+`Amazon DynamoDB Local`_ is a utility which can be used to mock DynamoDB
+during development. Connecting to a running DynamoDB Local server is easy::
+
+    #!/usr/bin/env python
+    from boto.dynamodb2.layer1 import DynamoDBConnection
+
+
+    # Connect to DynamoDB Local
+    conn = DynamoDBConnection(
+        host='localhost',
+        port=8000,
+        aws_secret_access_key='anything',
+        is_secure=False)
+
+    # List all local tables
+    tables = conn.list_tables()
+
+
+.. _`Amazon DynamoDB Local`: http://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Tools.html
 
 
 Next Steps

@@ -208,6 +208,39 @@ class DynamoDBv2Layer1Test(unittest.TestCase):
         results = self.dynamodb.scan(self.table_name)
         self.assertEqual(results['Count'], 1)
 
+        # Parallel scan (minus client-side threading).
+        self.dynamodb.batch_write_item({
+            self.table_name: [
+                {
+                    'PutRequest': {
+                        'Item': {
+                            'username': {'S': 'johndoe'},
+                            'first_name': {'S': 'Johann'},
+                            'last_name': {'S': 'Does'},
+                            'date_joined': {'N': '1366058000'},
+                            'friend_count': {'N': '1'},
+                            'friends': {'SS': ['jane']},
+                        },
+                    },
+                    'PutRequest': {
+                        'Item': {
+                            'username': {'S': 'alice'},
+                            'first_name': {'S': 'Alice'},
+                            'last_name': {'S': 'Expert'},
+                            'date_joined': {'N': '1366056800'},
+                            'friend_count': {'N': '2'},
+                            'friends': {'SS': ['johndoe', 'jane']},
+                        },
+                    },
+                },
+            ]
+        })
+        time.sleep(20)
+        results = self.dynamodb.scan(self.table_name, segment=0, total_segments=2)
+        self.assertTrue(results['Count'] in [1, 2])
+        results = self.dynamodb.scan(self.table_name, segment=1, total_segments=2)
+        self.assertTrue(results['Count'] in [1, 2])
+
     def test_without_range_key(self):
         result = self.create_table(
             self.table_name,
@@ -253,3 +286,39 @@ class DynamoDBv2Layer1Test(unittest.TestCase):
         self.assertEqual(johndoe['Item']['friends']['SS'], [
             'alice', 'bob', 'jane'
         ])
+
+    def test_throughput_exceeded_regression(self):
+        tiny_tablename = 'TinyThroughput'
+        tiny = self.create_table(
+            tiny_tablename,
+            self.attributes,
+            self.schema,
+            {
+                'ReadCapacityUnits': 1,
+                'WriteCapacityUnits': 1,
+            }
+        )
+
+        self.dynamodb.put_item(tiny_tablename, {
+            'username': {'S': 'johndoe'},
+            'first_name': {'S': 'John'},
+            'last_name': {'S': 'Doe'},
+            'date_joined': {'N': '1366056668'},
+        })
+        self.dynamodb.put_item(tiny_tablename, {
+            'username': {'S': 'jane'},
+            'first_name': {'S': 'Jane'},
+            'last_name': {'S': 'Doe'},
+            'date_joined': {'N': '1366056669'},
+        })
+        self.dynamodb.put_item(tiny_tablename, {
+            'username': {'S': 'alice'},
+            'first_name': {'S': 'Alice'},
+            'last_name': {'S': 'Expert'},
+            'date_joined': {'N': '1366057000'},
+        })
+        time.sleep(20)
+
+        for i in range(100):
+            # This would cause an exception due to a non-existant instance variable.
+            self.dynamodb.scan(tiny_tablename)

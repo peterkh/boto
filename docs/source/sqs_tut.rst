@@ -16,7 +16,7 @@ The recommended method of doing this is as follows::
     >>> import boto.sqs
     >>> conn = boto.sqs.connect_to_region(
     ...     "us-west-2",
-    ...     aws_access_key_id='<aws access key'>,
+    ...     aws_access_key_id='<aws access key>',
     ...     aws_secret_access_key='<aws secret key>')
 
 At this point the variable conn will point to an SQSConnection object in the
@@ -107,12 +107,13 @@ So, first we need to create a Message object::
 >>> from boto.sqs.message import Message
 >>> m = Message()
 >>> m.set_body('This is my first message.')
->>> status = q.write(m)
+>>> q.write(m)
 
-The write method returns a True if everything went well.  If the write
-didn't succeed it will either return a False (meaning SQS simply chose
-not to write the message for some reason) or an exception if there was
-some sort of problem with the request.
+The write method will return the ``Message`` object.  The ``id`` and
+``md5`` attribute of the ``Message`` object will be updated with the
+values of the message that was written to the queue.
+
+If the message cannot be written an ``SQSError`` exception will be raised.
 
 Writing Messages (Custom Format)
 --------------------------------
@@ -135,7 +136,7 @@ default boto Message object.  To register your message class, you would::
 >>> q.set_message_class(MyMessage)
 >>> m = MyMessage()
 >>> m.set_body('This is my first message.')
->>> status = q.write(m)
+>>> q.write(m)
 
 where MyMessage is the class definition for your message class.  Your
 message class should subclass the boto Message because there is a small
@@ -229,7 +230,7 @@ to count the number of messages in a queue:
 >>> q.count()
 10
 
-This can be handy but is command as well as the other two utility methods
+This can be handy but this command as well as the other two utility methods
 I'll describe in a minute are inefficient and should be used with caution
 on queues with lots of messages (e.g. many hundreds or more).  Similarly,
 you can clear (delete) all messages in a queue with:
